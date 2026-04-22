@@ -31,14 +31,22 @@ function isAutoMissingCheckEnabled() {
     return getLocalFlag('runpoddirect_auto_check', true);
 }
 
+function isPreQueueGuardEnabled() {
+    return getLocalFlag('runpoddirect_prequeue_guard', false);
+}
+
+function isStrictPreQueueHashCheckEnabled() {
+    return getLocalFlag('runpoddirect_prequeue_hash_check', false);
+}
+
 function debugLog(...args) {
     if (!isVerboseLogsEnabled()) return;
     console.log(...args);
 }
 
 // ComfyUI RunpodDirect Extension
-// Version: 1.0.8
-debugLog('[RunpodDirect] v1.0.8');
+// Version: 1.0.10
+debugLog('[RunpodDirect] v1.0.10');
 
 // Track download states
 const downloadStates = new Map();
@@ -197,8 +205,11 @@ const modelExistsAnywhereCache = new Map();
 const modelDiskExistsCache = new Map();
 const modelSizeCache = new Map();
 const modelIntegrityCache = new Map();
+const PREQUEUE_REPORT_TTL_MS = 10000;
 let queueGuardInstalled = false;
 let queueGuardBypassOnce = false;
+let queueGuardOriginalPrompt = null;
+let queueGuardWrappedPrompt = null;
 let autoMissingModalTimer = null;
 let autoMissingModalInFlight = false;
 let autoMissingModalSignature = '';
@@ -218,6 +229,7 @@ let runpodHubStylesInstalled = false;
 let managerModelIndexCache = null;
 let managerModelIndexPromise = null;
 let workflowGraphSnapshot = null;
+let preQueueReportCache = null;
 
 const THEME = {
     // Status colors
@@ -351,6 +363,7 @@ api.addEventListener("server_download_progress", ({ detail }) => {
 
 api.addEventListener("server_download_complete", ({ detail }) => {
     const { download_id, path, size } = detail;
+    invalidatePreQueueReportCache();
     if (isDownloadingAll) {
         completedDownloads++;
         debugLog(`[RunpodDirect] Progress: ${completedDownloads}/${totalDownloads} completed`);
@@ -369,6 +382,7 @@ api.addEventListener("server_download_complete", ({ detail }) => {
 
 api.addEventListener("server_download_error", ({ detail }) => {
     const { download_id, error } = detail;
+    invalidatePreQueueReportCache();
     if (isDownloadingAll) {
         completedDownloads++;
         debugLog(`[RunpodDirect] Progress: ${completedDownloads}/${totalDownloads} completed (1 error)`);
@@ -945,6 +959,29 @@ async function openRunpodHubPanel() {
     ));
 
     settings.appendChild(makeCheckboxRow(
+        'Pre-queue guard',
+        'Intercept Run and block queueing when required models appear to be missing.',
+        () => isPreQueueGuardEnabled(),
+        (enabled) => {
+            setLocalFlag('runpoddirect_prequeue_guard', enabled);
+            invalidatePreQueueReportCache();
+            syncPreQueueGuard();
+            return true;
+        },
+    ));
+
+    settings.appendChild(makeCheckboxRow(
+        'Strict pre-queue hash checks',
+        'Re-hash matching files before queueing. Safer for corruption checks, slower on large models.',
+        () => isStrictPreQueueHashCheckEnabled(),
+        (enabled) => {
+            setLocalFlag('runpoddirect_prequeue_hash_check', enabled);
+            invalidatePreQueueReportCache();
+            return true;
+        },
+    ));
+
+    settings.appendChild(makeCheckboxRow(
         'Connection keepalive',
         'Keep websocket alive via silent server pings to reduce proxy reconnects.',
         () => isServerWsKeepaliveEnabled(),
@@ -1254,6 +1291,43 @@ function buildMissingReportSignature(report) {
     }
     rows.sort();
     return rows.join('||');
+}
+
+function buildPreQueueCandidateSignature(candidates, verifyHashes = false) {
+    const rows = [];
+    for (const model of Array.isArray(candidates) ? candidates : []) {
+        const filename = sanitizeFilename(model?.filename).toLowerCase();
+        const url = normalizeDownloadUrl(model?.url || '');
+        const directory = String(model?.directory || '').toLowerCase();
+        const hash = verifyHashes ? String(model?.hash || '').toLowerCase() : '';
+        if (!filename) continue;
+        rows.push(`${filename}|${directory}|${url}|${hash}`);
+    }
+    rows.sort();
+    return rows.join('||');
+}
+
+function clonePreQueueReport(report) {
+    return cloneWorkflowData(report);
+}
+
+function getCachedPreQueueReport(signature) {
+    if (!preQueueReportCache) return null;
+    if (preQueueReportCache.signature !== signature) return null;
+    if ((Date.now() - preQueueReportCache.createdAt) > PREQUEUE_REPORT_TTL_MS) return null;
+    return clonePreQueueReport(preQueueReportCache.report);
+}
+
+function setCachedPreQueueReport(signature, report) {
+    preQueueReportCache = {
+        signature,
+        createdAt: Date.now(),
+        report: clonePreQueueReport(report),
+    };
+}
+
+function invalidatePreQueueReportCache() {
+    preQueueReportCache = null;
 }
 
 function shouldWaitForNativeMissingDialog(reason = '') {
@@ -2578,18 +2652,36 @@ async function collectPreQueueModelCandidates(folderPaths) {
     return await collectPreQueueModelCandidatesFromWorkflow(workflow, folderPaths);
 }
 
-async function checkMissingModelsForWorkflow(workflow, piniaPaths = {}) {
-    const folderPaths = await getAvailableFolderPaths(piniaPaths);
-    // Force re-read from disk every check so manual deletes are detected.
+async function checkMissingModelsViaBackend(candidates, folderPaths, options = {}) {
+    try {
+        const response = await api.fetchApi('/server_download/check_missing_models', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                models: candidates,
+                verify_hashes: !!options.verifyHashes,
+            }),
+        });
+        if (!response.ok) return null;
+        const data = await response.json();
+        return {
+            missing: Array.isArray(data?.missing) ? data.missing : [],
+            unresolved: Array.isArray(data?.unresolved) ? data.unresolved : [],
+            candidates,
+            folderPaths,
+        };
+    } catch (_e) {
+        return null;
+    }
+}
+
+async function checkMissingModelsForCandidatesFallback(candidates, folderPaths, options = {}) {
+    const verifyHashes = !!options.verifyHashes;
+    // Legacy path for older backends: keep behavior compatible if the batch route is unavailable.
     modelFolderCache.clear();
     modelExistsAnywhereCache.clear();
     modelDiskExistsCache.clear();
     modelIntegrityCache.clear();
-
-    const candidates = await collectPreQueueModelCandidatesFromWorkflow(workflow, folderPaths);
-    if (!candidates.length) {
-        return { missing: [], unresolved: [], candidates: [], folderPaths };
-    }
 
     const missing = [];
     const unresolved = [];
@@ -2627,7 +2719,7 @@ async function checkMissingModelsForWorkflow(workflow, piniaPaths = {}) {
             missing.push(model);
             continue;
         }
-        if (exists === true && model.hash) {
+        if (verifyHashes && exists === true && model.hash) {
             const integrity = await verifyModelIntegrity(
                 model.directory,
                 model.filename,
@@ -2643,11 +2735,36 @@ async function checkMissingModelsForWorkflow(workflow, piniaPaths = {}) {
     return { missing, unresolved, candidates, folderPaths };
 }
 
-async function checkMissingModelsBeforeQueue() {
+async function checkMissingModelsForWorkflow(workflow, piniaPaths = {}, options = {}) {
+    const verifyHashes = !!options.verifyHashes;
+    const folderPaths = await getAvailableFolderPaths(piniaPaths);
+    const candidates = await collectPreQueueModelCandidatesFromWorkflow(workflow, folderPaths);
+    if (!candidates.length) {
+        return { missing: [], unresolved: [], candidates: [], folderPaths };
+    }
+
+    const signature = buildPreQueueCandidateSignature(candidates, verifyHashes);
+    if (!options.forceRefresh) {
+        const cachedReport = getCachedPreQueueReport(signature);
+        if (cachedReport) {
+            return cachedReport;
+        }
+    }
+
+    let report = await checkMissingModelsViaBackend(candidates, folderPaths, { verifyHashes });
+    if (!report) {
+        report = await checkMissingModelsForCandidatesFallback(candidates, folderPaths, { verifyHashes });
+    }
+
+    setCachedPreQueueReport(signature, report);
+    return clonePreQueueReport(report);
+}
+
+async function checkMissingModelsBeforeQueue(options = {}) {
     const dialogState = getMissingModelsDialogState();
     const piniaPaths = dialogState?.paths || {};
     const workflow = getCurrentWorkflowData({ preferSnapshot: false, allowSerialize: true });
-    const { missing, unresolved, candidates } = await checkMissingModelsForWorkflow(workflow, piniaPaths);
+    const { missing, unresolved, candidates } = await checkMissingModelsForWorkflow(workflow, piniaPaths, options);
 
     debugLog(
         `[RunpodDirect] Pre-queue check: ${candidates.length} candidates, ${missing.length} missing, ${unresolved.length} unresolved`
@@ -2894,27 +3011,48 @@ function showPreQueueMissingModal(report, onQueueAnyway, options = {}) {
     document.body.appendChild(overlay);
 }
 
-function installAlwaysCheckQueueGuard(retryCount = 0) {
+function syncPreQueueGuard(retryCount = 0) {
+    if (!isPreQueueGuardEnabled()) {
+        if (queueGuardInstalled && app?.queuePrompt === queueGuardWrappedPrompt && typeof queueGuardOriginalPrompt === 'function') {
+            app.queuePrompt = queueGuardOriginalPrompt;
+            debugLog('[RunpodDirect] Pre-queue model check guard removed');
+        }
+        queueGuardInstalled = false;
+        queueGuardWrappedPrompt = null;
+        queueGuardOriginalPrompt = null;
+        queueGuardBypassOnce = false;
+        closePreQueueMissingModal();
+        return;
+    }
+
     if (queueGuardInstalled) return;
 
-    const originalQueuePrompt = app?.queuePrompt;
-    if (typeof originalQueuePrompt !== 'function') {
+    const currentQueuePrompt = app?.queuePrompt;
+    if (typeof currentQueuePrompt !== 'function') {
         if (retryCount < 20) {
-            setTimeout(() => installAlwaysCheckQueueGuard(retryCount + 1), 500);
+            setTimeout(() => syncPreQueueGuard(retryCount + 1), 500);
         } else {
             debugLog('[RunpodDirect] queuePrompt hook not available, pre-queue guard not installed');
         }
         return;
     }
 
-    app.queuePrompt = async function(number, batchCount = 1, queueNodeIds) {
+    const originalQueuePrompt = currentQueuePrompt;
+    queueGuardOriginalPrompt = originalQueuePrompt;
+    queueGuardWrappedPrompt = async function(number, batchCount = 1, queueNodeIds) {
+        if (!isPreQueueGuardEnabled()) {
+            return await originalQueuePrompt.call(this, number, batchCount, queueNodeIds);
+        }
+
         if (queueGuardBypassOnce) {
             queueGuardBypassOnce = false;
             return await originalQueuePrompt.call(this, number, batchCount, queueNodeIds);
         }
 
         try {
-            const report = await checkMissingModelsBeforeQueue();
+            const report = await checkMissingModelsBeforeQueue({
+                verifyHashes: isStrictPreQueueHashCheckEnabled(),
+            });
             if (report.missing.length > 0 || report.unresolved.length > 0) {
                 debugLog(
                     `[RunpodDirect] Blocking queue: ${report.missing.length} missing, ${report.unresolved.length} unresolved model(s)`
@@ -2935,6 +3073,7 @@ function installAlwaysCheckQueueGuard(retryCount = 0) {
         return await originalQueuePrompt.call(this, number, batchCount, queueNodeIds);
     };
 
+    app.queuePrompt = queueGuardWrappedPrompt;
     queueGuardInstalled = true;
     debugLog('[RunpodDirect] Pre-queue model check guard installed');
 }
@@ -4006,7 +4145,7 @@ app.registerExtension({
     async setup() {
         debugLog("[RunpodDirect] Extension setup starting");
         checkEnvHfToken();
-        installAlwaysCheckQueueGuard();
+        syncPreQueueGuard();
         setupDialogObserver();
         installAutoMissingCheckListeners();
         installRunpodHubListeners();
@@ -4093,6 +4232,7 @@ api.addEventListener("server_download_resumed", ({ detail }) => {
 
 api.addEventListener("server_download_cancelled", ({ detail }) => {
     const { download_id } = detail;
+    invalidatePreQueueReportCache();
     const prev = downloadStates.get(download_id) || {};
     downloadStates.set(download_id, { ...prev, status: 'cancelled' });
     window.dispatchEvent(new CustomEvent('serverDownloadUpdate', {

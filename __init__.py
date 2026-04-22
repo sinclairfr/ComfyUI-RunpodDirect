@@ -33,6 +33,7 @@ SOCK_READ_TIMEOUT = 120
 HASH_READ_CHUNK_SIZE = 8 * 1024 * 1024
 WS_KEEPALIVE_INTERVAL_SECONDS = 45
 SETTINGS_FILENAME = "runpoddirect_settings.json"
+PREQUEUE_CHECK_MAX_MODELS = 512
 
 _ws_keepalive_task = None
 _ws_keepalive_enabled = True
@@ -298,6 +299,61 @@ def _cleanup_partial_file(path):
             os.remove(path)
     except Exception as e:
         logging.warning(f"[RunpodDirect] Failed to remove partial file {path}: {e}")
+
+
+def _sanitize_simple_filename(filename):
+    if not filename or not isinstance(filename, str):
+        raise ValueError("Missing filename")
+
+    if "/" in filename or "\\" in filename or os.path.sep in filename:
+        raise ValueError("Invalid filename: must not contain path separators")
+
+    if ".." in filename or filename.startswith("/") or filename.startswith("~"):
+        raise ValueError("Invalid filename: path traversal patterns detected")
+
+    safe_filename = os.path.basename(filename)
+    if safe_filename != filename:
+        raise ValueError("Invalid filename: must be a simple filename without path components")
+
+    return safe_filename
+
+
+def _resolve_model_path(directory, safe_filename):
+    if directory not in folder_paths.folder_names_and_paths:
+        raise ValueError(f"Invalid directory: {directory}")
+
+    output_dir = os.path.abspath(folder_paths.folder_names_and_paths[directory][0][0])
+    model_path = os.path.abspath(os.path.join(output_dir, safe_filename))
+    if not model_path.startswith(output_dir + os.sep):
+        raise ValueError("Security error: attempted directory escape")
+
+    return output_dir, model_path
+
+
+def _model_exists_in_directory(directory, safe_filename):
+    try:
+        _, model_path = _resolve_model_path(directory, safe_filename)
+    except Exception:
+        return False
+    return os.path.exists(model_path)
+
+
+def _find_model_directory_anywhere(safe_filename, preferred_directories=None):
+    ordered_directories = []
+    seen = set()
+    for directory in preferred_directories or []:
+        if directory in folder_paths.folder_names_and_paths and directory not in seen:
+            ordered_directories.append(directory)
+            seen.add(directory)
+    for directory in folder_paths.folder_names_and_paths.keys():
+        if directory not in seen:
+            ordered_directories.append(directory)
+            seen.add(directory)
+
+    for directory in ordered_directories:
+        if _model_exists_in_directory(directory, safe_filename):
+            return directory
+    return None
 
 
 async def _emit_download_progress(download_id, total_size, force=False):
@@ -1153,6 +1209,103 @@ async def server_download_folder_paths(request):
         return web.json_response({"error": str(e)}, status=500)
 
 
+@PromptServer.instance.routes.post("/server_download/check_missing_models")
+async def check_missing_models(request):
+    """Batch-check workflow models without blocking queueing on many frontend round-trips."""
+    try:
+        json_data = await request.json()
+        models = json_data.get("models")
+        verify_hashes = _parse_bool(json_data.get("verify_hashes"), default=False)
+
+        if not isinstance(models, list):
+            return web.json_response(
+                {"error": "Missing required parameter: models"},
+                status=400
+            )
+
+        if len(models) > PREQUEUE_CHECK_MAX_MODELS:
+            return web.json_response(
+                {"error": f"Too many models requested. Max: {PREQUEUE_CHECK_MAX_MODELS}"},
+                status=400
+            )
+
+        missing = []
+        unresolved = []
+
+        for raw_model in models:
+            if not isinstance(raw_model, dict):
+                continue
+
+            report_model = dict(raw_model)
+            filename = raw_model.get("filename") or raw_model.get("name")
+            try:
+                safe_filename = _sanitize_simple_filename(filename)
+            except ValueError as e:
+                report_model["filename"] = str(filename or "")
+                report_model["reason"] = "invalid_filename"
+                report_model["error"] = str(e)
+                unresolved.append(report_model)
+                continue
+
+            report_model["filename"] = safe_filename
+
+            directory = raw_model.get("directory")
+            directory = str(directory) if isinstance(directory, str) and directory else None
+            if directory and directory not in folder_paths.folder_names_and_paths:
+                directory = None
+
+            expected_hash = _normalize_expected_hash(raw_model.get("hash"))
+            expected_hash_type = raw_model.get("hash_type")
+            found_directory = None
+
+            if directory:
+                if _model_exists_in_directory(directory, safe_filename):
+                    found_directory = directory
+                else:
+                    found_directory = _find_model_directory_anywhere(
+                        safe_filename,
+                        preferred_directories=[directory],
+                    )
+                    if not found_directory:
+                        report_model["directory"] = directory
+                        report_model["reason"] = "missing"
+                        missing.append(report_model)
+                        continue
+            else:
+                found_directory = _find_model_directory_anywhere(safe_filename)
+                if not found_directory:
+                    report_model["reason"] = "directory_unresolved"
+                    unresolved.append(report_model)
+                    continue
+
+            if verify_hashes and expected_hash:
+                hash_type = _resolve_hash_type(expected_hash, expected_hash_type)
+                if not hash_type:
+                    report_model["directory"] = found_directory
+                    report_model["reason"] = "unsupported_hash_type"
+                    unresolved.append(report_model)
+                    continue
+
+                _, model_path = _resolve_model_path(found_directory, safe_filename)
+                actual_hash = _compute_file_hash(model_path, hash_type)
+                if actual_hash.lower() != expected_hash.lower():
+                    report_model["directory"] = found_directory
+                    report_model["corrupted"] = True
+                    report_model["reason"] = "hash_mismatch"
+                    missing.append(report_model)
+
+        return web.json_response({
+            "success": True,
+            "missing": missing,
+            "unresolved": unresolved,
+            "checked": len(models),
+            "verify_hashes": verify_hashes,
+        })
+    except Exception as e:
+        logging.error(f"Error checking missing models: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+
 @PromptServer.instance.routes.post("/server_download/verify_model_integrity")
 async def verify_model_integrity(request):
     """Verify whether a model file exists and, when hash is provided, whether it matches."""
@@ -1326,7 +1479,7 @@ async def serve_js_with_version(request):
 WEB_DIRECTORY = "./web"
 
 # Version for cache busting - increment this when you update the JS
-__version__ = "1.0.8"
+__version__ = "1.0.10"
 
 # Apply cgroup-aware RAM patch, then load persisted settings, then start keepalive.
 _patch_comfy_ram_detection_for_cgroups()
