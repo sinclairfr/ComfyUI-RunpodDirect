@@ -1490,11 +1490,13 @@ async def validate_hf_token(request):
 
 @PromptServer.instance.routes.get(f"/extensions/{_EXTENSION_DIR_NAME}/serverDownload.js")
 async def serve_js_with_version(request):
-    """Serve JS file with cache-busting headers"""
+    """Serve JS file with cache-busting headers and explicit Content-Type for ES module compatibility."""
     js_path = os.path.join(os.path.dirname(__file__), "web", "serverDownload.js")
 
     response = web.FileResponse(js_path)
-    # Add cache control headers to force revalidation
+    # Explicitly set MIME type — minimal Docker images (Alpine, etc.) may lack a
+    # complete mimetypes database, causing browsers to reject the ES module import.
+    response.headers['Content-Type'] = 'application/javascript; charset=utf-8'
     response.headers['Cache-Control'] = 'no-cache, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
