@@ -839,13 +839,13 @@ function renderRunpodHubQueue() {
         if (status === 'downloading') {
             actions.appendChild(makeActionBtn('Pause', async () => {
                 await pauseDownload(entry.download_id);
-                void refreshDownloadStatesFromBackend();
+                await refreshDownloadStatesFromBackend();
                 renderRunpodHubQueue();
             }));
         } else if (status === 'paused') {
             actions.appendChild(makeActionBtn('Resume', async () => {
                 await resumeDownload(entry.download_id);
-                void refreshDownloadStatesFromBackend();
+                await refreshDownloadStatesFromBackend();
                 renderRunpodHubQueue();
             }, 'primary'));
         }
@@ -853,7 +853,7 @@ function renderRunpodHubQueue() {
         if (['queued', 'downloading', 'paused'].includes(status)) {
             actions.appendChild(makeActionBtn('Cancel', async () => {
                 await cancelDownload(entry.download_id);
-                void refreshDownloadStatesFromBackend();
+                await refreshDownloadStatesFromBackend();
                 renderRunpodHubQueue();
             }));
         }

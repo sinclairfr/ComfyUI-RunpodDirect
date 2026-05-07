@@ -25,7 +25,8 @@ download_queue = []
 current_download_task = None  # Only one download at a time
 
 # Configuration optimized for datacenter connections
-CHUNK_SIZE = 32 * 1024 * 1024  # 32MB chunks - balanced for 500MB to 30GB+ files
+CHUNK_SIZE = 32 * 1024 * 1024  # 32MB range-request size - balanced for 500MB to 30GB+ files
+READ_CHUNK_SIZE = 256 * 1024   # 256KB read buffer - allows pause/cancel to respond quickly
 NUM_CONNECTIONS = 8  # 8 parallel connections - optimal for DC bandwidth
 CHUNK_MAX_RETRIES = 4
 PROGRESS_EVENT_INTERVAL = 0.1  # seconds
@@ -899,7 +900,7 @@ async def download_chunk_with_progress(session, url, start, end, output_path, ch
 
                     with open(output_path, 'r+b') as f:
                         f.seek(range_start)
-                        async for chunk in response.content.iter_chunked(CHUNK_SIZE):
+                        async for chunk in response.content.iter_chunked(READ_CHUNK_SIZE):
                             # Check if paused
                             while download_control.get(download_id, {}).get("paused", False):
                                 await asyncio.sleep(0.5)
@@ -975,7 +976,7 @@ async def download_single_connection(session, url, output_path, download_id, tot
             raise Exception(f"HTTP {response.status}")
 
         with open(output_path, 'wb') as f:
-            async for chunk in response.content.iter_chunked(CHUNK_SIZE):
+            async for chunk in response.content.iter_chunked(READ_CHUNK_SIZE):
                 # Check if paused
                 while download_control.get(download_id, {}).get("paused", False):
                     await asyncio.sleep(0.5)
