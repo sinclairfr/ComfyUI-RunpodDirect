@@ -3078,6 +3078,39 @@ function showPreQueueMissingModal(report, onQueueAnyway, options = {}) {
         };
         footer.appendChild(openHubBtn);
     } else {
+        // Queue mode: offer download-and-queue if any missing model has a URL
+        const downloadableItems = missingItems.filter(m => m.url);
+        if (downloadableItems.length > 0) {
+            const downloadAllBtn = createEl('button', {
+                backgroundColor: THEME.primary,
+                color: THEME.foreground,
+                border: 'none',
+                height: '32px',
+                padding: '0 10px',
+                fontSize: '0.75rem',
+                borderRadius: '0.5rem',
+                cursor: 'pointer',
+                fontWeight: '600',
+            }, `Download (${downloadableItems.length})`);
+            downloadAllBtn.type = 'button';
+            downloadAllBtn.title = 'Download missing models, then queue';
+            downloadAllBtn.onclick = async () => {
+                closePreQueueMissingModal();
+                void openRunpodHubPanel();
+                for (const model of downloadableItems) {
+                    await startServerDownload(
+                        model.url,
+                        model.directory,
+                        model.filename,
+                        true,
+                        model.hash || null,
+                        model.hash_type || null
+                    );
+                }
+            };
+            footer.appendChild(downloadAllBtn);
+        }
+
         const queueAnywayBtn = createEl('button', {
             backgroundColor: THEME.warning,
             color: THEME.foreground,
@@ -3725,10 +3758,18 @@ function findMissingModelsContainer() {
 
     const dialogs = document.querySelectorAll('[role="dialog"]');
     for (const dialog of dialogs) {
-        const text = dialog.textContent || '';
-        if (text.includes('missing models') || text.includes('Missing models')) {
-            const scrollable = dialog.querySelector('[class*="overflow-y-auto"]');
+        // Skip our own pre-queue overlay — it's handled separately
+        if (dialog.closest('.server-download-prequeue-overlay')) continue;
+        const textLower = (dialog.textContent || '').toLowerCase();
+        if (textLower.includes('missing models') || textLower.includes('missing model')) {
+            // Try the standard scrollable list container first, then any overflow container
+            const scrollable =
+                dialog.querySelector('[class*="overflow-y-auto"]') ||
+                dialog.querySelector('[class*="overflow-auto"]') ||
+                dialog.querySelector('ul, ol, [role="list"]');
             if (scrollable) return scrollable;
+            // Last resort: return the dialog body itself
+            return dialog;
         }
     }
     return null;
@@ -4201,7 +4242,7 @@ function setupDialogObserver() {
                                 : node.querySelector('[role="dialog"]');
                             if (dialog) {
                                 const text = dialog.textContent || '';
-                                if (text.includes('missing models') || text.includes('Missing models')) {
+                                if (text.toLowerCase().includes('missing models') || text.toLowerCase().includes('missing model')) {
                                     debugLog('[ServerDirect] Detected missing models dialog');
                                     const fromCustomOverlay = !!dialog.closest('.server-download-prequeue-overlay');
                                     if (!fromCustomOverlay && document.querySelector('.server-download-prequeue-overlay')) {
