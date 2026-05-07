@@ -87,7 +87,9 @@ function debugLog(...args) {
 
 // ComfyUI ServerDirect Extension — works on RunPod, Vast.ai, Lambda Labs, and any cloud GPU host
 // Version: 1.1.0
-debugLog('[ServerDirect] v1.1.0');
+// Always log on startup so users can confirm the extension JS was loaded (open DevTools → Console)
+console.log('[ServerDirect] v1.1.0 loaded — EXTENSION_BASE:', EXTENSION_BASE);
+debugLog('[ServerDirect] v1.1.0 (verbose mode active)');
 
 // Track download states
 const downloadStates = new Map();
@@ -582,15 +584,33 @@ function setRunpodHubButtonActive(active) {
 
 function ensureRunpodTopBarButton() {
     if (document.querySelector('.serverdirect-top-btn')) return true;
-    const group = document.querySelector('.comfyui-button-group');
-    if (!(group instanceof HTMLElement)) return false;
+
+    // Try multiple toolbar selectors across different ComfyUI versions / themes.
+    // ComfyUI 0.2x (Vue/PrimeVue): uses .comfyui-menu, .comfyui-menu-right, or .comfy-vue-side-bar-container
+    // Older ComfyUI: uses .comfyui-button-group
+    const TOOLBAR_SELECTORS = [
+        '.comfyui-menu-right',        // ComfyUI 0.20+ right side of top bar
+        '.comfyui-menu',              // ComfyUI 0.20+ menu bar
+        '.comfyui-button-group',      // older ComfyUI
+        '.p-toolbar-end',             // PrimeVue toolbar end slot
+        '.p-toolbar',                 // PrimeVue toolbar fallback
+    ];
+
+    let anchor = null;
+    for (const sel of TOOLBAR_SELECTORS) {
+        const el = document.querySelector(sel);
+        if (el instanceof HTMLElement) { anchor = el; break; }
+    }
+    if (!anchor) return false;
+
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'comfyui-button serverdirect-top-btn serverdirect-fallback-btn';
     btn.textContent = 'ServerDirect';
-    btn.title = 'ServerDirect downloads and settings';
+    btn.title = 'ServerDirect – direct model downloads';
     btn.onclick = () => toggleRunpodHubPanel();
-    group.appendChild(btn);
+    anchor.appendChild(btn);
+    console.log('[ServerDirect] Fallback toolbar button injected into', anchor.className);
     return true;
 }
 
@@ -4184,24 +4204,31 @@ app.registerExtension({
     ],
 
     async setup() {
-        debugLog("[ServerDirect] Extension setup starting");
-        checkEnvHfToken();
-        syncPreQueueGuard();
-        setupDialogObserver();
-        installAutoMissingCheckListeners();
-        installRunpodHubListeners();
-        installRunpodHubStyles();
+        console.log("[ServerDirect] Extension setup() called");
+        try { checkEnvHfToken(); } catch(e) { console.warn('[ServerDirect] checkEnvHfToken failed', e); }
+        try { syncPreQueueGuard(); } catch(e) { console.warn('[ServerDirect] syncPreQueueGuard failed', e); }
+        try { setupDialogObserver(); } catch(e) { console.warn('[ServerDirect] setupDialogObserver failed', e); }
+        try { installAutoMissingCheckListeners(); } catch(e) { console.warn('[ServerDirect] installAutoMissingCheckListeners failed', e); }
+        try { installRunpodHubListeners(); } catch(e) { console.warn('[ServerDirect] installRunpodHubListeners failed', e); }
+        try { installRunpodHubStyles(); } catch(e) { console.warn('[ServerDirect] installRunpodHubStyles failed', e); }
         void refreshDownloadStatesFromBackend();
         setTimeout(() => {
-            if (document.querySelector('.serverdirect-top-btn')) return;
+            if (document.querySelector('.serverdirect-top-btn')) {
+                console.log('[ServerDirect] Toolbar button present (registered via actionBarButtons)');
+                return;
+            }
+            console.log('[ServerDirect] actionBarButtons button not found — starting fallback injection');
             let attempts = 0;
             const timer = setInterval(() => {
                 attempts += 1;
-                if (ensureRunpodTopBarButton() || attempts >= 20) {
+                if (ensureRunpodTopBarButton() || attempts >= 30) {
                     clearInterval(timer);
+                    if (attempts >= 30) {
+                        console.warn('[ServerDirect] Could not inject toolbar button after 30 attempts — no matching toolbar selector found');
+                    }
                 }
             }, 300);
-        }, 1200);
+        }, 1500);
         scheduleAutoMissingModelsCheck('setup-initial', 1200);
 
         setTimeout(() => {
@@ -4214,7 +4241,7 @@ app.registerExtension({
             injectServerDownloadButtons();
         }, 3000);
 
-        debugLog("[ServerDirect] Extension setup complete");
+        console.log("[ServerDirect] Extension setup() complete");
     },
 
     async beforeConfigureGraph(graphData) {
