@@ -586,7 +586,7 @@ function ensureRunpodTopBarButton() {
     if (document.querySelector('.serverdirect-top-btn')) return true;
 
     // Try multiple toolbar selectors across different ComfyUI versions / themes.
-    // ComfyUI 0.2x (Vue/PrimeVue): uses .comfyui-menu, .comfyui-menu-right, or .comfy-vue-side-bar-container
+    // ComfyUI 0.2x (Vue/PrimeVue): uses .comfyui-menu, .comfyui-menu-right
     // Older ComfyUI: uses .comfyui-button-group
     const TOOLBAR_SELECTORS = [
         '.comfyui-menu-right',        // ComfyUI 0.20+ right side of top bar
@@ -601,17 +601,50 @@ function ensureRunpodTopBarButton() {
         const el = document.querySelector(sel);
         if (el instanceof HTMLElement) { anchor = el; break; }
     }
-    if (!anchor) return false;
 
+    if (anchor) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'comfyui-button serverdirect-top-btn serverdirect-fallback-btn';
+        btn.textContent = 'ServerDirect';
+        btn.title = 'ServerDirect – direct model downloads';
+        btn.onclick = () => toggleRunpodHubPanel();
+        anchor.appendChild(btn);
+        console.log('[ServerDirect] Fallback toolbar button injected into', anchor.className);
+        return true;
+    }
+
+    // Last resort: fixed floating button that works on ANY ComfyUI version/theme.
+    // Only created once; removed automatically when a proper button later appears.
+    _ensureFloatingFallbackButton();
+    return false; // still return false so the caller keeps retrying toolbar injection
+}
+
+function _ensureFloatingFallbackButton() {
+    const FLOAT_ID = 'serverdirect-float-btn';
+    if (document.getElementById(FLOAT_ID)) return;
     const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'comfyui-button serverdirect-top-btn serverdirect-fallback-btn';
-    btn.textContent = 'ServerDirect';
+    btn.id = FLOAT_ID;
+    btn.textContent = '⬇ ServerDirect';
     btn.title = 'ServerDirect – direct model downloads';
+    Object.assign(btn.style, {
+        position:   'fixed',
+        bottom:     '16px',
+        right:      '16px',
+        zIndex:     '99999',
+        padding:    '8px 14px',
+        background: '#2563eb',
+        color:      '#fff',
+        border:     'none',
+        borderRadius: '6px',
+        fontWeight: '600',
+        fontSize:   '13px',
+        cursor:     'pointer',
+        boxShadow:  '0 2px 8px rgba(0,0,0,0.35)',
+    });
     btn.onclick = () => toggleRunpodHubPanel();
-    anchor.appendChild(btn);
-    console.log('[ServerDirect] Fallback toolbar button injected into', anchor.className);
-    return true;
+    document.body.appendChild(btn);
+    console.log('[ServerDirect] No toolbar anchor found — floating fallback button added (bottom-right corner)');
 }
 
 function getRunpodHubFilename(downloadId) {
@@ -4221,10 +4254,17 @@ app.registerExtension({
             let attempts = 0;
             const timer = setInterval(() => {
                 attempts += 1;
-                if (ensureRunpodTopBarButton() || attempts >= 30) {
+                const toolbarFound = ensureRunpodTopBarButton();
+                // If a real toolbar button appeared (from a later actionBarButtons render),
+                // remove the floating fallback to avoid duplicates.
+                const floatBtn = document.getElementById('serverdirect-float-btn');
+                if (floatBtn && document.querySelector('.comfyui-menu .serverdirect-top-btn, .comfyui-button-group .serverdirect-top-btn')) {
+                    floatBtn.remove();
+                }
+                if (toolbarFound || attempts >= 30) {
                     clearInterval(timer);
-                    if (attempts >= 30) {
-                        console.warn('[ServerDirect] Could not inject toolbar button after 30 attempts — no matching toolbar selector found');
+                    if (!toolbarFound && attempts >= 30) {
+                        console.warn('[ServerDirect] No toolbar anchor found — using floating button (bottom-right corner)');
                     }
                 }
             }, 300);
