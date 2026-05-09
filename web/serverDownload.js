@@ -88,8 +88,8 @@ function debugLog(...args) {
 // ComfyUI ServerDirect Extension — works on RunPod, Vast.ai, Lambda Labs, and any cloud GPU host
 // Version: 1.1.0
 // Always log on startup so users can confirm the extension JS was loaded (open DevTools → Console)
-console.log('[ServerDirect] v1.1.0 loaded — EXTENSION_BASE:', EXTENSION_BASE);
-debugLog('[ServerDirect] v1.1.0 (verbose mode active)');
+console.log('[ServerDirect] v1.1.1 loaded — EXTENSION_BASE:', EXTENSION_BASE);
+debugLog('[ServerDirect] v1.1.1 (verbose mode active)');
 
 // Track download states
 const downloadStates = new Map();
@@ -1446,7 +1446,26 @@ async function waitForNativeMissingDialog(timeoutMs = 4200, pollMs = 120) {
 
 async function maybeAutoShowMissingModelsModal(reason = 'auto') {
     if (!isAutoMissingCheckEnabled()) return null;
-    debugLog(`[ServerDirect] Auto-check (${reason}): skipped (auto fallback modal disabled)`);
+
+    // If a missing models dialog is already visible, inject our buttons into it
+    if (findVisibleMissingModelsDialog() || getMissingModelsDialogState()) {
+        debugLog(`[ServerDirect] Auto-check (${reason}): found open dialog, injecting buttons`);
+        void injectServerDownloadButtons();
+        return findVisibleMissingModelsDialog();
+    }
+
+    // For graph/workflow load events, wait briefly for the native dialog to appear
+    if (shouldWaitForNativeMissingDialog(reason)) {
+        const appeared = await waitForNativeMissingDialog(1500);
+        if (appeared) {
+            debugLog(`[ServerDirect] Auto-check (${reason}): native dialog appeared`);
+            void injectServerDownloadButtons();
+        } else {
+            debugLog(`[ServerDirect] Auto-check (${reason}): no missing models dialog`);
+        }
+        return appeared ? findVisibleMissingModelsDialog() : null;
+    }
+
     return null;
 }
 
