@@ -4264,7 +4264,11 @@ function setupDialogObserver() {
                                 if (text.toLowerCase().includes('missing models') || text.toLowerCase().includes('missing model')) {
                                     debugLog('[ServerDirect] Detected missing models dialog');
                                     const fromCustomOverlay = !!dialog.closest('.server-download-prequeue-overlay');
-                                    if (!fromCustomOverlay && document.querySelector('.server-download-prequeue-overlay')) {
+                                    if (fromCustomOverlay) {
+                                        debugLog('[ServerDirect] Dialog is our own pre-queue overlay — skipping injection');
+                                        return;
+                                    }
+                                    if (document.querySelector('.server-download-prequeue-overlay')) {
                                         debugLog('[ServerDirect] Closing custom missing-model dialog because native dialog is now visible');
                                         closePreQueueMissingModal();
                                     }
