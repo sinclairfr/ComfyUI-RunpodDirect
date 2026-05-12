@@ -253,6 +253,7 @@ let queueGuardInstalled = false;
 let queueGuardBypassOnce = false;
 let queueGuardOriginalPrompt = null;
 let queueGuardWrappedPrompt = null;
+let queueGuardCheckInFlight = false;
 let autoMissingModalTimer = null;
 let autoMissingModalInFlight = false;
 let autoMissingModalSignature = '';
@@ -2946,7 +2947,7 @@ function showPreQueueMissingModal(report, onQueueAnyway, options = {}) {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        zIndex: '2000',
+        zIndex: '9999',
         padding: '16px',
     });
     overlay.className = 'server-download-prequeue-overlay';
@@ -3097,7 +3098,8 @@ function showPreQueueMissingModal(report, onQueueAnyway, options = {}) {
         };
         footer.appendChild(openHubBtn);
     } else {
-        // Queue mode: offer download-and-queue if any missing model has a URL
+        // Queue mode: offer download-and-queue if any missing model has a URL,
+        // otherwise show "Open ServerDirect" so the user can manage downloads manually.
         const downloadableItems = missingItems.filter(m => m.url);
         if (downloadableItems.length > 0) {
             const downloadAllBtn = createEl('button', {
@@ -3128,6 +3130,26 @@ function showPreQueueMissingModal(report, onQueueAnyway, options = {}) {
                 }
             };
             footer.appendChild(downloadAllBtn);
+        } else {
+            // No URLs available — show the hub so users can enter download URLs manually
+            const openHubBtn = createEl('button', {
+                backgroundColor: THEME.primary,
+                color: THEME.foreground,
+                border: 'none',
+                height: '32px',
+                padding: '0 10px',
+                fontSize: '0.75rem',
+                borderRadius: '0.5rem',
+                cursor: 'pointer',
+                fontWeight: '600',
+            }, 'Open ServerDirect');
+            openHubBtn.type = 'button';
+            openHubBtn.title = 'Open ServerDirect hub to manage downloads';
+            openHubBtn.onclick = () => {
+                closePreQueueMissingModal();
+                void openRunpodHubPanel();
+            };
+            footer.appendChild(openHubBtn);
         }
 
         const queueAnywayBtn = createEl('button', {
@@ -3167,6 +3189,7 @@ function syncPreQueueGuard(retryCount = 0) {
         queueGuardWrappedPrompt = null;
         queueGuardOriginalPrompt = null;
         queueGuardBypassOnce = false;
+        queueGuardCheckInFlight = false;
         closePreQueueMissingModal();
         return;
     }
@@ -3195,6 +3218,14 @@ function syncPreQueueGuard(retryCount = 0) {
             return await originalQueuePrompt.call(this, number, batchCount, queueNodeIds);
         }
 
+        // If a check is already running, don't start another one — the existing
+        // popup (or the one that's about to appear) is already handling this queue attempt.
+        if (queueGuardCheckInFlight) {
+            debugLog('[ServerDirect] Pre-queue check already in flight, blocking duplicate queue attempt');
+            return false;
+        }
+
+        queueGuardCheckInFlight = true;
         try {
             const report = await checkMissingModelsBeforeQueue({
                 verifyHashes: isStrictPreQueueHashCheckEnabled(),
@@ -3211,6 +3242,8 @@ function syncPreQueueGuard(retryCount = 0) {
             }
         } catch (error) {
             console.error('[ServerDirect] Pre-queue model check failed, allowing queue', error);
+        } finally {
+            queueGuardCheckInFlight = false;
         }
 
         closePreQueueMissingModal();
