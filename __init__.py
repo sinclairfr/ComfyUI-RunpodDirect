@@ -11,8 +11,6 @@ import asyncio
 import hashlib
 import time
 import threading
-import subprocess
-import sys
 import folder_paths
 import comfy.model_management as comfy_mm
 from aiohttp import web
@@ -41,9 +39,6 @@ _LEGACY_SETTINGS_FILENAME = "runpoddirect_settings.json"
 
 # Dynamically resolve the directory name so routes work regardless of install directory
 _EXTENSION_DIR_NAME = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
-_CUSTOM_NODES_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_COMFYUI_ROOT = os.path.dirname(_CUSTOM_NODES_DIR)
-CUSTOM_NODES_LIST_FILENAME = "custom_nodes_list.json"
 PREQUEUE_CHECK_MAX_MODELS = 512
 
 _ws_keepalive_task = None
@@ -140,82 +135,6 @@ def _read_cgroup_memory_limit_and_usage():
     if usage < 0:
         usage = 0
     return limit, usage
-
-
-def _install_custom_nodes_from_config():
-    """Clone missing custom nodes listed in custom_nodes_list.json at ComfyUI root."""
-    config_path = os.path.join(_COMFYUI_ROOT, CUSTOM_NODES_LIST_FILENAME)
-    if not os.path.exists(config_path):
-        return
-
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            nodes = json.load(f)
-    except Exception as e:
-        logging.warning(f"[ServerDirect] Failed to read {CUSTOM_NODES_LIST_FILENAME}: {e}")
-        return
-
-    if not isinstance(nodes, list):
-        logging.warning(f"[ServerDirect] {CUSTOM_NODES_LIST_FILENAME} must be a JSON array, skipping.")
-        return
-
-    for entry in nodes:
-        if not isinstance(entry, dict):
-            continue
-        url = entry.get("url", "").strip()
-        if not url:
-            continue
-
-        # Derive directory name from the URL if not explicitly provided
-        name = entry.get("name") or url.rstrip("/").split("/")[-1]
-        if name.endswith(".git"):
-            name = name[:-4]
-
-        target_dir = os.path.join(_CUSTOM_NODES_DIR, name)
-        if os.path.exists(target_dir):
-            logging.info(f"[ServerDirect] Custom node already present, skipping: {name}")
-            continue
-
-        logging.info(f"[ServerDirect] Cloning custom node '{name}' from {url} ...")
-        cmd = ["git", "clone", "--depth", "1"]
-        branch = entry.get("branch", "").strip()
-        if branch:
-            cmd += ["--branch", branch]
-        cmd += [url, target_dir]
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-            if result.returncode != 0:
-                logging.error(
-                    f"[ServerDirect] git clone failed for '{name}': {result.stderr.strip()}"
-                )
-                continue
-            logging.info(f"[ServerDirect] Successfully cloned '{name}'")
-        except FileNotFoundError:
-            logging.error("[ServerDirect] 'git' command not found — cannot install custom nodes.")
-            return
-        except subprocess.TimeoutExpired:
-            logging.error(f"[ServerDirect] git clone timed out for '{name}'")
-            continue
-        except Exception as e:
-            logging.error(f"[ServerDirect] Unexpected error cloning '{name}': {e}")
-            continue
-
-        # Install Python dependencies if present
-        req_file = os.path.join(target_dir, "requirements.txt")
-        if os.path.exists(req_file):
-            logging.info(f"[ServerDirect] Installing requirements for '{name}' ...")
-            try:
-                subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "-r", req_file, "-q"],
-                    timeout=300,
-                    check=True,
-                )
-                logging.info(f"[ServerDirect] Requirements installed for '{name}'")
-            except subprocess.CalledProcessError as e:
-                logging.warning(f"[ServerDirect] pip install failed for '{name}': {e}")
-            except subprocess.TimeoutExpired:
-                logging.warning(f"[ServerDirect] pip install timed out for '{name}'")
 
 
 def _patch_comfy_ram_detection_for_cgroups():
@@ -1593,8 +1512,7 @@ WEB_DIRECTORY = "./web"
 # Version for cache busting - increment this when you update the JS
 __version__ = "1.1.0"
 
-# Install custom nodes from config, then apply patches and load settings.
-_install_custom_nodes_from_config()
+# Apply cgroup-aware RAM patch, then load persisted settings, then start keepalive.
 _patch_comfy_ram_detection_for_cgroups()
 _load_persisted_settings()
 _ensure_ws_keepalive_task()
